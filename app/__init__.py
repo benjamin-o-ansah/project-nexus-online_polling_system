@@ -40,7 +40,40 @@ def create_app(config_class=Config) -> Flask:
     app.register_blueprint(results_bp, url_prefix="/api/polls")
     app.register_blueprint(admin_bp, url_prefix="/api/admin")
 
+    @app.before_request
+    def assign_request_id():
+        g.request_id = str(uuid.uuid4())
 
+    @app.after_request
+    def attach_request_id(response):
+        response.headers["X-Request-Id"] = getattr(g, "request_id", "")
+        return response
+
+    @app.errorhandler(Exception)
+    def handle_exception(e):
+        # Always log full traceback with request_id
+        app.logger.exception("Unhandled exception request_id=%s path=%s", getattr(g, "request_id", None), request.path)
+
+        if isinstance(e, HTTPException):
+            return {
+                "success": False,
+                "error": {
+                    "code": e.name.upper().replace(" ", "_"),
+                    "message": e.description if isinstance(e.description, str) else "Request error",
+                    "details": getattr(e, "description", None) if isinstance(e.description, dict) else None,
+                },
+                "request_id": getattr(g, "request_id", None)
+            }, e.code
+
+    return {
+        "success": False,
+        "error": {
+            "code": "INTERNAL_SERVER_ERROR",
+            "message": "An unexpected error occurred",
+            "details": None
+        },
+        "request_id": getattr(g, "request_id", None)
+    }, 500
 
     # Health check
     @app.get("/health")
