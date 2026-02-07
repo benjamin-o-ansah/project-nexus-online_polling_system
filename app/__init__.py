@@ -1,8 +1,8 @@
 from dotenv import load_dotenv
-from .app.errors import register_error_handlers
+from .errors import register_error_handlers
 from flask import Flask
-from .app.config import Config
-from .app.extensions import db, migrate, jwt, ma, swagger, mail
+from .config import Config
+from .extensions import db, migrate, jwt, ma, swagger, mail
 from .models.token_blocklist import TokenBlocklist
 from flasgger import Swagger
 from .swagger_config import swagger_template
