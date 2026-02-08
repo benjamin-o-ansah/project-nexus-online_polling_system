@@ -7,12 +7,27 @@ from .models.token_blocklist import TokenBlocklist
 from flasgger import Swagger
 from .swagger_config import swagger_template
 from .middleware.request_id import init_request_id
-
+from flask_cors import CORS
 load_dotenv()
 
 def create_app(config_class=Config) -> Flask:
     app = Flask(__name__)
     app.config.from_object(config_class)
+
+    CORS(
+        app,
+        resources={r"/api/*": {"origins": [
+            "http://localhost:3000",
+            "http://127.0.0.1:3000"
+        ]}},
+        supports_credentials=True,
+        allow_headers=[
+            "Content-Type",
+            "Authorization",
+        ],
+        methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    )
+
     Swagger(app, template=swagger_template(app))
     # Extensions
     db.init_app(app)
