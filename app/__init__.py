@@ -2,7 +2,7 @@ from dotenv import load_dotenv
 from .errors import register_error_handlers
 from flask import Flask
 from .config import Config
-from .extensions import db, migrate, jwt, ma, swagger, mail
+from .extensions import db, migrate, jwt, ma
 from .models.token_blocklist import TokenBlocklist
 from flasgger import Swagger
 from .swagger_config import swagger_template
@@ -20,7 +20,7 @@ def create_app(config_class=Config) -> Flask:
     jwt.init_app(app)
     ma.init_app(app)
     # swagger.init_app(app)
-    mail.init_app(app)
+    # mail.init_app(app)
 
     # Middleware + errors
     init_request_id(app)

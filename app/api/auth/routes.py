@@ -7,26 +7,27 @@ from flask_jwt_extended import (
     jwt_required,get_jwt
 )
 from datetime import datetime, timedelta
-from sqlalchemy.exc import IntegrityError
+# from sqlalchemy.exc import IntegrityError
 from ...utils.audit import audit_log
 from ...extensions import db
 from ...models.user import User
-from ...models.otp_challenge import OTPChallenge
+# from ...models.otp_challenge import OTPChallenge
 from ...models.token_blocklist import TokenBlocklist
-from ...schemas.auth import RegisterSchema,  LoginRequestOTPSchema, LoginVerifyOTPSchema
+from ...schemas.auth import RegisterSchema, LoginSchema
 from ...schemas.user import UserSchema
-from ...utils.otp import generate_otp, hash_otp, verify_otp
-from ...utils.mailer import send_otp_email
+
 from ...utils.validation import validate_or_abort
+from datetime import datetime
 
 
+from app.schemas import user
 
+from app.utils import otp
 
 auth_bp = Blueprint("auth", __name__)
 
 register_schema = RegisterSchema()
-login_req_schema = LoginRequestOTPSchema()
-login_verify_schema = LoginVerifyOTPSchema()
+login_req_schema= LoginSchema()
 user_schema = UserSchema()
 
 
@@ -78,163 +79,258 @@ def register():
 
     return {"message": "User registered successfully", "user": user_schema.dump(user)}, 201
 
-
-@auth_bp.post("/login/request-otp")
+@auth_bp.post("/login")
 @swag_from({
     "tags": ["Auth"],
-    "summary": "Request OTP for login",
-    "description": "Validates email/password, then sends OTP. Returns a challenge_id used to verify OTP and complete login.",
-    "responses": {200: {"description": "OTP sent"}, 400: {"description": "Validation error"}, 401: {"description": "Invalid credentials"}}
+    "summary": "Login with email and password",
+    "description": "Validates email/password and returns access/refresh tokens on successful login.",
+    "responses": {
+        200: {"description": "Login successful, tokens returned"},
+        400: {"description": "Validation error"},
+        401: {"description": "Invalid credentials"},
+        403: {"description": "User account not active"}
+    }
 })
-def request_login_otp():
+def login():
+    """
+    Authenticate user with email and password
+    Returns access and refresh tokens on successful authentication
+    """
     payload = request.get_json(silent=True) or {}
     payload = validate_or_abort(login_req_schema, payload)
     email = payload["email"].lower().strip()
     password = payload["password"]
 
+    # Find user by email
     user = User.query.filter_by(email=email).first()
-    if not user or not user.is_active or not user.check_password(password):
-        # Important: avoid user enumeration, keep response generic
-        audit_log(
-                action="LOGIN_OTP_REQUEST_DENIED",
-                entity_type="AUTH",
-                details={"email": email}
-            )
-        return {"message": "Invalid credentials"}, 401
-
-    # Generate OTP + store hashed
-    otp = generate_otp(current_app.config["OTP_LENGTH"])
-    ttl = current_app.config["OTP_TTL_SECONDS"]
-    challenge = OTPChallenge(
-        user_id=user.id,
-        otp_hash=hash_otp(otp),
-        expires_at= datetime.utcnow() + timedelta(seconds=ttl),
-        last_sent_at=datetime.utcnow(),
-        attempts=0,
-    )
-    db.session.add(challenge)
-    db.session.flush()
-    audit_log(
-    action="LOGIN_OTP_REQUESTED",
-    entity_type="AUTH",
-    details =
-    {"email": user.email,
-    "challenge_id": str(challenge.id)
-             }
-)
-    db.session.commit()
     
-
-
-    # Send OTP (email for MVP)
+    # Check if user exists and password is correct
+    if not user or not user.check_password(password):
+        audit_log(
+            action="LOGIN_FAILED_INVALID_CREDENTIALS",
+            entity_type="AUTH",
+            details={"email": email}
+        )
+        return {"message": "Invalid email or password"}, 401
+    
+    # Check if user account is active
+    if not user.is_active:
+        audit_log(
+            action="LOGIN_FAILED_INACTIVE_ACCOUNT",
+            entity_type="AUTH",
+            details={
+                "user_id": str(user.id),
+                "email": user.email
+            }
+        )
+        return {"message": "Account is not active. Please contact support."}, 403
+    
+    # Generate JWT tokens
     try:
-        send_otp_email(user.email, otp)
+        additional_claims = {"role": user.role}
+        
+        # Create access token (short-lived)
+        access_token = create_access_token(
+            identity=str(user.id), 
+            additional_claims=additional_claims
+        )
+        
+        # Create refresh token (long-lived)
+        refresh_token = create_refresh_token(
+            identity=str(user.id),
+            additional_claims=additional_claims
+        )
+        
+        # Update last login timestamp if you have that field
+        if hasattr(user, 'last_login_at'):
+            user.last_login_at = datetime.utcnow()
+            db.session.commit()
+        
+        # Successful login audit log
         audit_log(
-    action="LOGIN_OTP_SENT",
-    entity_type="AUTH",
-    details={
-        "user_id": str(user.id),
-        "challenge_id": str(challenge.id)
-    }
-)
-
-        return {"message": "OTP sent. Kindly check your mail.", "challenge_id": str(challenge.id)}, 200
+            action="LOGIN_SUCCESS",
+            entity_type="AUTH",
+            details={
+                "user_id": str(user.id),
+                "email": user.email,
+                "role": user.role
+            }
+        )
+        
+        # Return successful response with tokens
+        return {
+            "message": "Login successful",
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "token_type": "bearer",
+            "user": {
+                "id": str(user.id),
+                "email": user.email,
+                "role": user.role
+                # Add other user fields as needed
+            }
+        }, 200
+        
     except Exception as e:
-    # Dev fallback: log OTP so you can continue testing
+        # Log token generation error
+        current_app.logger.error(f"Token generation failed: {str(e)}")
         audit_log(
-                action="LOGIN_OTP_SEND_FAILED",
-                entity_type="AUTH",
-                details={
-                    "user_id": str(user.id),
-                    "challenge_id": str(challenge.id)
-                }
-            )
-
-        current_app.logger.warning("OTP email failed (%s). OTP for %s is: %s", e, user.email, otp)
-        return {"message": "Failed to send OTP. Check mail configuration."}, 500
-
+            action="LOGIN_TOKEN_GENERATION_FAILED",
+            entity_type="AUTH",
+            details={
+                "user_id": str(user.id),
+                "email": user.email,
+                "error": str(e)
+            }
+        )
+        return {"message": "Authentication service error. Please try again."}, 500
 
 
-@auth_bp.post("/login/verify-otp")
-@swag_from({
-    "tags": ["Auth"],
-    "summary": "Verify OTP and login",
-    "description": "Verifies OTP challenge; on success returns access/refresh tokens and a message that login was successful.",
-    "responses": {200: {"description": "Tokens issued"}, 400: {"description": "Validation error"}, 401: {"description": "Invalid/expired OTP"}}
-})
-def verify_login_otp():
-    payload = request.get_json(silent=True) or {}
-    payload = validate_or_abort(login_verify_schema, payload)
-    challenge_id = payload["challenge_id"]
-    otp = payload["otp"].strip()
-
-    challenge = OTPChallenge.query.get(challenge_id)
-    if not challenge:
-        audit_log(
-    action="LOGIN_OTP_VERIFY_FAILED",
-    entity_type="AUTH",
-    details={
-        "challenge_id": str(challenge.id),
-        "attempts": challenge.attempts
-    }
-)
-
-        return {"message": "Invalid OTP"}, 401
-
-    if challenge.is_used() or challenge.is_expired():
-        audit_log(
-    action="LOGIN_OTP_EXPIRED",
-    entity_type="AUTH",
-    details={"challenge_id": str(challenge.id)}
-)
-
-        return {"message": "OTP expired or already used"}, 401
-
-    max_attempts = current_app.config["OTP_MAX_ATTEMPTS"]
-    if challenge.attempts >= max_attempts:
-        audit_log(
-    action="LOGIN_OTP_ATTEMPTS_EXCEEDED",
-    entity_type="AUTH",
-    details={
-        "challenge_id": str(challenge.id),
-        "attempts": challenge.attempts
-    }
-)
-
-        return {"message": "OTP attempts exceeded"}, 401
-
-    # Increment attempts before verification to prevent timing attacks
-    challenge.attempts += 1
-    db.session.flush()
-
-    if not verify_otp(otp, challenge.otp_hash):
-        db.session.commit()
-        return {"message": "Invalid OTP"}, 401
-
-    # Mark used
-    challenge.used_at = datetime.utcnow()
-
-    user = User.query.get(challenge.user_id)
-    if not user or not user.is_active:
-        db.session.commit()
-        return {"message": "User inactive or not found"}, 401
-
-    additional_claims = {"role": user.role}
-    access = create_access_token(identity=str(user.id), additional_claims=additional_claims)
-    refresh = create_refresh_token(identity=str(user.id), additional_claims=additional_claims)
-
-    db.session.commit()
-    audit_log(
-    action="LOGIN_SUCCESS",
-    entity_type="AUTH",
-    details={
-        "user_id": str(user.id),
-        "role": user.role
-    }
-)
 
 
-    return {"access_token": access, "refresh_token": refresh, "message": "Login successful"}, 200
+# @auth_bp.post("/login/request-otp")
+# @swag_from({
+#     "tags": ["Auth"],
+#     "summary": "Request OTP for login",
+#     "description": "Validates email/password, then sends OTP. Returns a challenge_id used to verify OTP and complete login.",
+#     "responses": {200: {"description": "OTP sent"}, 400: {"description": "Validation error"}, 401: {"description": "Invalid credentials"}}
+# })
+# def request_login_otp():
+#     payload = request.get_json(silent=True) or {}
+#     payload = validate_or_abort(login_req_schema, payload)
+#     email = payload["email"].lower().strip()
+#     password = payload["password"]
+
+#     user = User.query.filter_by(email=email).first()
+#     if not user or not user.is_active or not user.check_password(password):
+#         audit_log(
+#             action="LOGIN_OTP_REQUEST_DENIED",
+#             entity_type="AUTH",
+#             details={"email": email}
+#         )
+#         return {"message": "Invalid credentials"}, 401
+
+#     # Generate OTP + store hashed
+#     otp = generate_otp(current_app.config["OTP_LENGTH"])
+#     ttl = current_app.config["OTP_TTL_SECONDS"]
+#     challenge = OTPChallenge(
+#         user_id=user.id,
+#         otp_hash=hash_otp(otp),
+#         expires_at=datetime.utcnow() + timedelta(seconds=ttl),
+#         last_sent_at=datetime.utcnow(),
+#         attempts=0,
+#     )
+#     db.session.add(challenge)
+#     db.session.flush()
+    
+#     audit_log(
+#         action="LOGIN_OTP_REQUESTED",
+#         entity_type="AUTH",
+#         details={
+#             "email": user.email,
+#             "challenge_id": str(challenge.id)
+#         }
+#     )
+#     db.session.commit()
+
+#     # Send OTP via Brevo
+#     try:
+#         send_login_otp_email(user.email, otp)
+#         audit_log(action="LOGIN_OTP_EMAIL_SENT", entity_type="AUTH", details={"email": user.email})
+#     except Exception as e:
+#         current_app.logger.warning("OTP email failed: %s", str(e))
+#         audit_log(
+#             action="LOGIN_OTP_EMAIL_FAILED",
+#             entity_type="AUTH",
+#             details={"email": user.email, "reason": str(e)},
+#         )
+
+#     # Always return success-ish response to avoid leaking whether user exists
+#         return {"success": True, "message": "If the email is valid, an OTP will be delivered shortly."}, 202
+        
+
+
+
+# @auth_bp.post("/login/verify-otp")
+# @swag_from({
+#     "tags": ["Auth"],
+#     "summary": "Verify OTP and login",
+#     "description": "Verifies OTP challenge; on success returns access/refresh tokens and a message that login was successful.",
+#     "responses": {200: {"description": "Tokens issued"}, 400: {"description": "Validation error"}, 401: {"description": "Invalid/expired OTP"}}
+# })
+# def verify_login_otp():
+#     payload = request.get_json(silent=True) or {}
+#     payload = validate_or_abort(login_verify_schema, payload)
+#     challenge_id = payload["challenge_id"]
+#     otp = payload["otp"].strip()
+
+#     challenge = OTPChallenge.query.get(challenge_id)
+#     if not challenge:
+#         audit_log(
+#     action="LOGIN_OTP_VERIFY_FAILED",
+#     entity_type="AUTH",
+#     details={
+#         "challenge_id": str(challenge.id),
+#         "attempts": challenge.attempts
+#     }
+# )
+
+#         return {"message": "Invalid OTP"}, 401
+
+#     if challenge.is_used() or challenge.is_expired():
+#         audit_log(
+#     action="LOGIN_OTP_EXPIRED",
+#     entity_type="AUTH",
+#     details={"challenge_id": str(challenge.id)}
+# )
+
+#         return {"message": "OTP expired or already used"}, 401
+
+#     max_attempts = current_app.config["OTP_MAX_ATTEMPTS"]
+#     if challenge.attempts >= max_attempts:
+#         audit_log(
+#     action="LOGIN_OTP_ATTEMPTS_EXCEEDED",
+#     entity_type="AUTH",
+#     details={
+#         "challenge_id": str(challenge.id),
+#         "attempts": challenge.attempts
+#     }
+# )
+
+#         return {"message": "OTP attempts exceeded"}, 401
+
+#     # Increment attempts before verification to prevent timing attacks
+#     challenge.attempts += 1
+#     db.session.flush()
+
+#     if not verify_otp(otp, challenge.otp_hash):
+#         db.session.commit()
+#         return {"message": "Invalid OTP"}, 401
+
+#     # Mark used
+#     challenge.used_at = datetime.utcnow()
+
+#     user = User.query.get(challenge.user_id)
+#     if not user or not user.is_active:
+#         db.session.commit()
+#         return {"message": "User inactive or not found"}, 401
+
+#     additional_claims = {"role": user.role}
+#     access = create_access_token(identity=str(user.id), additional_claims=additional_claims)
+#     refresh = create_refresh_token(identity=str(user.id), additional_claims=additional_claims)
+
+#     db.session.commit()
+#     audit_log(
+#     action="LOGIN_SUCCESS",
+#     entity_type="AUTH",
+#     details={
+#         "user_id": str(user.id),
+#         "role": user.role
+#     }
+# )
+
+
+#     return {"access_token": access, "refresh_token": refresh, "message": "Login successful"}, 200
 
 
 # ---------- TOKEN REFRESH / ME / LOGOUT ----------
