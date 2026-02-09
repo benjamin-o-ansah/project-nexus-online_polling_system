@@ -1,6 +1,7 @@
 from dotenv import load_dotenv
 from .errors import register_error_handlers
 from flask import Flask
+import os
 from .config import Config
 from .extensions import db, migrate, jwt, ma
 from .models.token_blocklist import TokenBlocklist
@@ -8,14 +9,16 @@ from flasgger import Swagger
 from .swagger_config import swagger_template
 from .middleware.request_id import init_request_id
 from flask_cors import CORS
-load_dotenv()
 
+load_dotenv()
+origins = os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
 def create_app(config_class=Config) -> Flask:
     app = Flask(__name__)
     app.config.from_object(config_class)
 
     CORS(
         app,
+        origins="*",
         resources={r"/api/*": {"origins": [
             "http://localhost:3000",
             "http://127.0.0.1:3000"
