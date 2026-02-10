@@ -75,6 +75,14 @@ def create_app(config_class=Config) -> Flask:
             return True
         return TokenBlocklist.is_blocklisted(jti)
     
+
+    @app.teardown_appcontext
+    def shutdown_session(exception=None):
+        try:
+            if exception:
+                db.session.rollback()
+        finally:
+            db.session.remove()
     
 
     return app
