@@ -39,3 +39,23 @@ def audit_log(
         details=details or None,
     )
     db.session.add(log)
+
+def secure_audit_log(action, entity_type=None, entity_id=None, details=None):
+    session = db.create_scoped_session()
+    try:
+        log = AuditLog(
+            actor_user_id=None,
+            actor_role=None,
+            action=action,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            ip_address=request.headers.get("X-Forwarded-For", request.remote_addr),
+            user_agent=request.headers.get("User-Agent"),
+            details=details or None,
+        )
+        session.add(log)
+        session.commit()
+    except Exception:
+        session.rollback()
+    finally:
+        session.close()

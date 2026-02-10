@@ -8,7 +8,7 @@ from flask_jwt_extended import (
 )
 from datetime import datetime, timedelta
 # from sqlalchemy.exc import IntegrityError
-from ...utils.audit import audit_log
+from ...utils.audit import audit_log,secure_audit_log
 from ...extensions import db
 from ...models.user import User
 # from ...models.otp_challenge import OTPChallenge
@@ -57,27 +57,31 @@ user_schema = UserSchema()
     }
 })
 def register():
-    payload = request.get_json(silent=True) or {}
-    payload = validate_or_abort(register_schema, payload)
+   
+    payload = validate_or_abort(register_schema, request.get_json(silent=True) or {})
     email = payload["email"].lower().strip()
-    password = payload["password"]
-    role = payload.get("role", "VOTER")
 
     if User.query.filter_by(email=email).first():
+        secure_audit_log(
+            action="REGISTER_FAILED_EMAIL_EXISTS",
+            entity_type="AUTH",
+            details={"email": email}
+        )
         return {"message": "Email already registered"}, 409
 
-    user = User(email=email, role=role)
-    user.set_password(password)
+    user = User(email=email, role=payload.get("role", "VOTER"))
+    user.set_password(payload["password"])
 
-    db.session.add(user)
-    db.session.commit()
-    audit_log(
-    action="USER_REGISTERED",
-    entity_type="AUTH",
-    details={"email": user.email, "role": user.role}
-)
+    with db.session.begin():
+        db.session.add(user)
+        audit_log(
+            "USER_REGISTERED",
+            "AUTH",
+            details={"email": user.email, "role": user.role}
+        )
 
     return {"message": "User registered successfully", "user": user_schema.dump(user)}, 201
+
 
 @auth_bp.post("/login")
 @swag_from({
@@ -96,94 +100,61 @@ def login():
     Authenticate user with email and password
     Returns access and refresh tokens on successful authentication
     """
-    payload = request.get_json(silent=True) or {}
-    payload = validate_or_abort(login_req_schema, payload)
+    payload = validate_or_abort(login_req_schema, request.get_json(silent=True) or {})
+   
     email = payload["email"].lower().strip()
     password = payload["password"]
 
-    # Find user by email
     user = User.query.filter_by(email=email).first()
-    
-    # Check if user exists and password is correct
+
+    # --- SECURITY EVENTS (persist independently)
     if not user or not user.check_password(password):
-        audit_log(
-            action="LOGIN_FAILED_INVALID_CREDENTIALS",
-            entity_type="AUTH",
+        secure_audit_log(
+            "LOGIN_FAILED_INVALID_CREDENTIALS",
+            "AUTH",
             details={"email": email}
         )
         return {"message": "Invalid email or password"}, 401
-    
-    # Check if user account is active
+
     if not user.is_active:
-        audit_log(
-            action="LOGIN_FAILED_INACTIVE_ACCOUNT",
-            entity_type="AUTH",
-            details={
-                "user_id": str(user.id),
-                "email": user.email
-            }
+        secure_audit_log(
+            "LOGIN_FAILED_INACTIVE_ACCOUNT",
+            "AUTH",
+            details={"email": user.email, "user_id": str(user.id)}
         )
-        return {"message": "Account is not active. Please contact support."}, 403
-    
-    # Generate JWT tokens
+        return {"message": "Account is inactive"}, 403
+
+    # --- Business Transaction (atomic)
     try:
-        additional_claims = {"role": user.role}
-        
-        # Create access token (short-lived)
-        access_token = create_access_token(
-            identity=str(user.id), 
-            additional_claims=additional_claims
-        )
-        
-        # Create refresh token (long-lived)
-        refresh_token = create_refresh_token(
-            identity=str(user.id),
-            additional_claims=additional_claims
-        )
-        
-        # Update last login timestamp if you have that field
-        if hasattr(user, 'last_login_at'):
-            user.last_login_at = datetime.utcnow()
-            db.session.commit()
-        
-        # Successful login audit log
-        audit_log(
-            action="LOGIN_SUCCESS",
-            entity_type="AUTH",
-            details={
-                "user_id": str(user.id),
-                "email": user.email,
-                "role": user.role
-            }
-        )
-        
-        # Return successful response with tokens
+        access = create_access_token(identity=str(user.id), additional_claims={"role": user.role})
+        refresh = create_refresh_token(identity=str(user.id), additional_claims={"role": user.role})
+
+        with db.session.begin():
+            if hasattr(user, "last_login_at"):
+                user.last_login_at = datetime.utcnow()
+
+            audit_log(
+                "LOGIN_SUCCESS",
+                "AUTH",
+                details={"user_id": str(user.id), "email": user.email, "role": user.role}
+            )
+
         return {
             "message": "Login successful",
-            "access_token": access_token,
-            "refresh_token": refresh_token,
+            "access_token": access,
+            "refresh_token": refresh,
             "token_type": "bearer",
-            "user": {
-                "id": str(user.id),
-                "email": user.email,
-                "role": user.role
-                # Add other user fields as needed
-            }
+            "user": user_schema.dump(user)
         }, 200
-        
+
     except Exception as e:
-        # Log token generation error
-        current_app.logger.error(f"Token generation failed: {str(e)}")
-        audit_log(
-            action="LOGIN_TOKEN_GENERATION_FAILED",
-            entity_type="AUTH",
-            details={
-                "user_id": str(user.id),
-                "email": user.email,
-                "error": str(e)
-            }
+        secure_audit_log(
+            "LOGIN_TOKEN_GENERATION_FAILED",
+            "AUTH",
+            details={"error": str(e), "user_id": str(user.id)}
         )
-        return {"message": "Authentication service error. Please try again."}, 500
+        return {"message": "Authentication error"}, 500
+
 
 
 
@@ -348,19 +319,24 @@ def login():
   }
 })
 def refresh():
-    user_id = get_jwt_identity()
-    user = User.query.get(user_id)
-    if not user or not user.is_active:
-        return {"message": "User inactive or not found"}, 401
+    
+  user_id = get_jwt_identity()
+  user = User.query.get(user_id)
 
-    access = create_access_token(identity=str(user.id), additional_claims={"role": user.role})
-    audit_log(
-    action="TOKEN_REFRESHED",
-    entity_type="AUTH",
-    details={"user_id": str(user_id)}
-)
+  if not user or not user.is_active:
+    return {"message": "User inactive or not found"}, 401
 
-    return {"access_token": access}, 200
+  access = create_access_token(identity=str(user.id), additional_claims={"role": user.role})
+
+  with db.session.begin():
+        audit_log(
+            "TOKEN_REFRESHED",
+            "AUTH",
+            details={"user_id": str(user.id)}
+        )
+
+  return {"access_token": access}, 200
+
 
 
 @auth_bp.get("/me")
@@ -376,18 +352,22 @@ def refresh():
   }
 })
 def me():
+    
     user_id = get_jwt_identity()
     user = User.query.get(user_id)
+
     if not user:
         return {"message": "User not found"}, 404
-    
-    audit_log(
-    action="AUTH_ME_VIEWED",
-    entity_type="AUTH",
-    details={"user_id": str(get_jwt_identity())}
-)
+
+    # READ event → secure audit (no DB mutation)
+    secure_audit_log(
+        "AUTH_ME_VIEWED",
+        "AUTH",
+        details={"user_id": str(user.id)}
+    )
 
     return {"user": user_schema.dump(user)}, 200
+
 
 
 @auth_bp.post("/logout")
@@ -409,43 +389,35 @@ def logout():
     """
     jwt_payload = get_jwt()
     jti = jwt_payload.get("jti")
-    if not jti:
-        return {"message": "Invalid token"}, 400
+    user_id = get_jwt_identity()
 
-    db.session.add(TokenBlocklist(jti=jti))
-    audit_log(
-    action="LOGOUT_ACCESS",
-    entity_type="AUTH",
-    details={
-        "user_id": str(get_jwt_identity()),
-        "jti": jti
-    }
-)
-
-    db.session.commit()
+    with db.session.begin():
+        db.session.add(TokenBlocklist(jti=jti))
+        audit_log(
+            "LOGOUT_ACCESS",
+            "AUTH",
+            details={"user_id": str(user_id), "jti": jti}
+        )
     return {"message": "Logged out successfully"}, 200
+
 
 
 @auth_bp.post("/logout/refresh")
 @jwt_required(refresh=True)
 def logout_refresh():
     """Revoke the refresh token to fully log out the session."""
+    
     jwt_payload = get_jwt()
     jti = jwt_payload.get("jti")
-    if not jti:
-        return {"message": "Invalid token"}, 400
+    user_id = get_jwt_identity()
 
-    db.session.add(TokenBlocklist(jti=jti))
-    audit_log(
-    action="LOGOUT_REFRESH",
-    entity_type="AUTH",
-    details={
-        "user_id": str(get_jwt_identity()),
-        "jti": jti
-    }
-)
-
-    db.session.commit()
+    with db.session.begin():
+        db.session.add(TokenBlocklist(jti=jti))
+        audit_log(
+            "LOGOUT_REFRESH",
+            "AUTH",
+            details={"user_id": str(user_id), "jti": jti}
+        )
     return {"message": "Refresh token revoked"}, 200
 
 
