@@ -35,27 +35,36 @@ def _safe_audit_read(action: str, entity_type: str, entity_id: str | None = None
         db.session.rollback()
         current_app.logger.exception("Audit logging failed (read endpoint): %s", action)
 
+def _is_sys_admin(role: str | None) -> bool:
+    return role == "SYSTEM_ADMIN"
+
+
+def _is_owner_poll_admin(role: str | None, user_id, poll: Poll) -> bool:
+    return role == "POLL_ADMIN" and user_id and str(poll.owner_id) == str(user_id)
+
+def _assert_can_manage_poll(poll: Poll):
+    """
+    Allow POLL_ADMIN (owner) OR SYSTEM_ADMIN to manage (publish/close/delete/update).
+    Returns (user_id, role, actor_type) for auditing.
+    """
+    role = (get_jwt() or {}).get("role")
+    user_id = get_jwt_identity()
+
+    if _is_sys_admin(role):
+        return user_id, role, "SYSTEM_ADMIN"
+
+    if _is_owner_poll_admin(role, user_id, poll):
+        return user_id, role, "POLL_ADMIN_OWNER"
+
+    return None, role, None
+
 
 @polls_bp.post("/")
 @jwt_required()
-@roles_required("POLL_ADMIN")
+@roles_required("POLL_ADMIN", "SYSTEM_ADMIN")
 @swag_from({
     "tags": ["Polls"],
-    "summary": "Create a poll (admin only)",
-    "parameters": [{
-        "in": "body",
-        "name": "body",
-        "required": True,
-        "schema": {
-            "type": "object",
-            "properties": {
-                "title": {"type": "string", "example": "Best Programming Language?"},
-                "description": {"type": "string", "example": "Vote for your favorite."},
-                "options": {"type": "array", "items": {"type": "object", "properties": {"text": {"type": "string"}}}}
-            },
-            "required": ["title", "options"]
-        }
-    }],
+    "summary": "Create a poll (poll admin or system admin)",
     "responses": {201: {"description": "Created"}, 400: {"description": "Validation error"}, 403: {"description": "Forbidden"}}
 })
 def create_poll():
@@ -63,7 +72,9 @@ def create_poll():
     payload = validate_or_abort(poll_create_schema, payload)
 
     owner_id = get_jwt_identity()
+    role = (get_jwt() or {}).get("role")
 
+    # If SYSTEM_ADMIN creates a poll, they become the owner by default (simple + consistent)
     poll = Poll(
         owner_id=owner_id,
         title=payload["title"].strip(),
@@ -73,17 +84,16 @@ def create_poll():
 
     try:
         db.session.add(poll)
-        db.session.flush()  # poll.id available
+        db.session.flush()
 
         for opt in payload["options"]:
             db.session.add(Option(poll_id=poll.id, text=opt["text"].strip()))
 
-        # ✅ Audit BEFORE commit so poll/options/audit are in one atomic transaction
         audit_log(
             action="POLL_CREATED",
             entity_type="POLL",
             entity_id=str(poll.id),
-            details={"title": poll.title}
+            details={"title": poll.title, "created_by_role": role}
         )
 
         db.session.commit()
@@ -103,14 +113,17 @@ def create_poll():
 @swag_from({
     "tags": ["Polls"],
     "summary": "List polls",
-    "description": "Admins see their own polls; other roles see active polls only (can be adjusted).",
+    "description": "POLL_ADMIN sees own polls; SYSTEM_ADMIN sees all; others see active polls only.",
     "responses": {200: {"description": "OK"}, 401: {"description": "Unauthorized"}}
 })
 def list_polls():
     user_id = get_jwt_identity()
     role = (get_jwt() or {}).get("role")
 
-    if role == "POLL_ADMIN":
+    if role == "SYSTEM_ADMIN":
+        polls = Poll.query.order_by(Poll.created_at.desc()).all()
+        scope = "all"
+    elif role == "POLL_ADMIN":
         polls = Poll.query.filter_by(owner_id=user_id).order_by(Poll.created_at.desc()).all()
         scope = "own"
     else:
@@ -137,8 +150,8 @@ def get_poll(poll_id):
     role = (get_jwt() or {}).get("role")
     user_id = get_jwt_identity()
 
-    if poll.status == Poll.STATUS_DRAFT and not (role == "POLL_ADMIN" and str(poll.owner_id) == str(user_id)):
-        # Optional: audit denied access (best-effort)
+    # SYSTEM_ADMIN can view everything (including drafts)
+    if poll.status == Poll.STATUS_DRAFT and not (_is_sys_admin(role) or _is_owner_poll_admin(role, user_id, poll)):
         _safe_audit_read(
             action="POLL_VIEW_DENIED",
             entity_type="POLL",
@@ -151,7 +164,7 @@ def get_poll(poll_id):
         action="POLL_VIEWED",
         entity_type="POLL",
         entity_id=str(poll.id),
-        details={"status": poll.status}
+        details={"status": poll.status, "role": role}
     )
 
     return {"poll": poll_read_schema.dump(poll)}, 200
@@ -159,15 +172,15 @@ def get_poll(poll_id):
 
 @polls_bp.put("/<uuid:poll_id>")
 @jwt_required()
-@roles_required("POLL_ADMIN")
-@swag_from({"tags": ["Polls"], "summary": "Update poll (draft only)", "responses": {200: {}, 400: {}, 403: {}, 404: {}}})
+@roles_required("POLL_ADMIN", "SYSTEM_ADMIN")
+@swag_from({"tags": ["Polls"], "summary": "Update poll (draft only) - owner poll admin or system admin", "responses": {200: {}, 400: {}, 403: {}, 404: {}}})
 def update_poll(poll_id):
     poll = Poll.query.get(poll_id)
     if not poll:
         return {"message": "Poll not found"}, 404
 
-    user_id = get_jwt_identity()
-    if str(poll.owner_id) != str(user_id):
+    user_id, role, actor_type = _assert_can_manage_poll(poll)
+    if not actor_type:
         return {"message": "Forbidden"}, 403
 
     if not poll.can_edit():
@@ -182,7 +195,6 @@ def update_poll(poll_id):
         if "description" in payload:
             poll.description = payload.get("description") or None
 
-        # MVP: if options provided, replace them
         if "options" in payload:
             poll.options.clear()
             db.session.flush()
@@ -193,7 +205,7 @@ def update_poll(poll_id):
             action="POLL_UPDATED",
             entity_type="POLL",
             entity_id=str(poll.id),
-            details={"updated_fields": list(payload.keys())}
+            details={"updated_fields": list(payload.keys()), "actor_role": role, "actor_type": actor_type}
         )
 
         db.session.commit()
@@ -207,15 +219,15 @@ def update_poll(poll_id):
 
 @polls_bp.post("/<uuid:poll_id>/publish")
 @jwt_required()
-@roles_required("POLL_ADMIN")
-@swag_from({"tags": ["Polls"], "summary": "Publish poll (draft -> active)", "responses": {200: {}, 400: {}, 403: {}, 404: {}}})
+@roles_required("POLL_ADMIN", "SYSTEM_ADMIN")
+@swag_from({"tags": ["Polls"], "summary": "Publish poll (draft -> active) - owner poll admin or system admin", "responses": {200: {}, 400: {}, 403: {}, 404: {}}})
 def publish_poll(poll_id):
     poll = Poll.query.get(poll_id)
     if not poll:
         return {"message": "Poll not found"}, 404
 
-    user_id = get_jwt_identity()
-    if str(poll.owner_id) != str(user_id):
+    user_id, role, actor_type = _assert_can_manage_poll(poll)
+    if not actor_type:
         return {"message": "Forbidden"}, 403
 
     try:
@@ -225,7 +237,12 @@ def publish_poll(poll_id):
             action="POLL_PUBLISHED",
             entity_type="POLL",
             entity_id=str(poll.id),
-            details={"from_status": Poll.STATUS_DRAFT, "to_status": Poll.STATUS_ACTIVE}
+            details={
+                "from_status": Poll.STATUS_DRAFT,
+                "to_status": Poll.STATUS_ACTIVE,
+                "actor_role": role,
+                "actor_type": actor_type,
+            }
         )
 
         db.session.commit()
@@ -242,15 +259,15 @@ def publish_poll(poll_id):
 
 @polls_bp.post("/<uuid:poll_id>/close")
 @jwt_required()
-@roles_required("POLL_ADMIN")
-@swag_from({"tags": ["Polls"], "summary": "Close poll (active -> closed)", "responses": {200: {}, 400: {}, 403: {}, 404: {}}})
+@roles_required("POLL_ADMIN", "SYSTEM_ADMIN")
+@swag_from({"tags": ["Polls"], "summary": "Close poll (active -> closed) - owner poll admin or system admin", "responses": {200: {}, 400: {}, 403: {}, 404: {}}})
 def close_poll(poll_id):
     poll = Poll.query.get(poll_id)
     if not poll:
         return {"message": "Poll not found"}, 404
 
-    user_id = get_jwt_identity()
-    if str(poll.owner_id) != str(user_id):
+    user_id, role, actor_type = _assert_can_manage_poll(poll)
+    if not actor_type:
         return {"message": "Forbidden"}, 403
 
     try:
@@ -260,7 +277,7 @@ def close_poll(poll_id):
             action="POLL_CLOSED",
             entity_type="POLL",
             entity_id=str(poll.id),
-            details={"to_status": Poll.STATUS_CLOSED}
+            details={"to_status": Poll.STATUS_CLOSED, "actor_role": role, "actor_type": actor_type}
         )
 
         db.session.commit()
@@ -277,15 +294,15 @@ def close_poll(poll_id):
 
 @polls_bp.delete("/<uuid:poll_id>")
 @jwt_required()
-@roles_required("POLL_ADMIN")
-@swag_from({"tags": ["Polls"], "summary": "Delete poll", "responses": {204: {}, 403: {}, 404: {}}})
+@roles_required("POLL_ADMIN", "SYSTEM_ADMIN")
+@swag_from({"tags": ["Polls"], "summary": "Delete poll - owner poll admin or system admin", "responses": {204: {}, 403: {}, 404: {}}})
 def delete_poll(poll_id):
     poll = Poll.query.get(poll_id)
     if not poll:
         return {"message": "Poll not found"}, 404
 
-    user_id = get_jwt_identity()
-    if str(poll.owner_id) != str(user_id):
+    user_id, role, actor_type = _assert_can_manage_poll(poll)
+    if not actor_type:
         return {"message": "Forbidden"}, 403
 
     try:
@@ -293,7 +310,7 @@ def delete_poll(poll_id):
             action="POLL_DELETED",
             entity_type="POLL",
             entity_id=str(poll.id),
-            details={"title": poll.title}
+            details={"title": poll.title, "actor_role": role, "actor_type": actor_type}
         )
 
         db.session.delete(poll)
