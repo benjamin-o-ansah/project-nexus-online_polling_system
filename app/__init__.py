@@ -11,7 +11,7 @@ from .middleware.request_id import init_request_id
 from flask_cors import CORS
 
 load_dotenv()
-origins = os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
+origins = os.getenv("CORS_ORIGINS", "https://projectnexuspolling.vercel.app").split(",")
 def create_app(config_class=Config) -> Flask:
     app = Flask(__name__)
     app.config.from_object(config_class)
@@ -24,7 +24,7 @@ def create_app(config_class=Config) -> Flask:
             "http://127.0.0.1:3000",
             "http://localhost:8080",
             "http://127.0.0.1:8080",
-            "https://projectnexuspolling.vercel.app/"
+            "https://projectnexuspolling.vercel.app"
 
         ]}},
         supports_credentials=True,
