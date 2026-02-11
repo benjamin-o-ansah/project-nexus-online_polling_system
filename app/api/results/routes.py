@@ -5,9 +5,10 @@ from sqlalchemy.exc import SQLAlchemyError
 from flask_jwt_extended import (
     verify_jwt_in_request,
     get_jwt_identity,
+    jwt_required,
     get_jwt,
 )
-
+from ...utils.rbac import roles_required
 from ...utils.audit import audit_log
 from ...extensions import db
 from ...models.polls import Poll
@@ -154,3 +155,125 @@ def poll_results(poll_id):
             current_app.logger.exception("Audit logging failed: POLL_RESULTS_FETCH_FAILED")
 
         return {"message": "Failed to fetch results"}, 500
+
+@results_bp.get("/closed")
+@jwt_required()
+@roles_required("VOTER")
+@swag_from({
+    "tags": ["Results"],
+    "summary": "VOTER: Get results for ALL CLOSED polls",
+    "description": "Returns results (vote counts + percentages) for every poll that is CLOSED.",
+    "responses": {
+        200: {"description": "Closed poll results"},
+        401: {"description": "Unauthorized"},
+        403: {"description": "Forbidden"},
+        500: {"description": "Server error"},
+    }
+})
+def closed_polls_results():
+    role = (get_jwt() or {}).get("role")
+
+    try:
+        closed_polls = (
+            Poll.query
+            .filter_by(status=Poll.STATUS_CLOSED)
+            .order_by(Poll.closed_at.desc())
+            .all()
+        )
+
+        poll_ids = [p.id for p in closed_polls]
+        if not poll_ids:
+            # audit success
+            audit_log(
+                action="CLOSED_POLL_RESULTS_LISTED",
+                entity_type="POLL",
+                entity_id=None,
+                details={"role": role, "count": 0},
+            )
+            db.session.commit()
+            return {"count": 0, "polls": []}, 200
+
+        # Fetch all options for these polls (stable ordering per poll)
+        options = (
+            Option.query
+            .filter(Option.poll_id.in_(poll_ids))
+            .order_by(Option.poll_id.asc(), Option.created_at.asc())
+            .all()
+        )
+
+        # Vote counts grouped by (poll_id, option_id)
+        rows = (
+            db.session.query(
+                Vote.poll_id.label("poll_id"),
+                Vote.option_id.label("option_id"),
+                func.count(Vote.id).label("votes"),
+            )
+            .filter(Vote.poll_id.in_(poll_ids))
+            .group_by(Vote.poll_id, Vote.option_id)
+            .all()
+        )
+
+        counts_map = {(r.poll_id, r.option_id): int(r.votes) for r in rows}
+
+        # Group options by poll_id
+        options_by_poll = {}
+        for opt in options:
+            options_by_poll.setdefault(opt.poll_id, []).append(opt)
+
+        response_polls = []
+        for poll in closed_polls:
+            poll_options = options_by_poll.get(poll.id, [])
+
+            total_votes = 0
+            for opt in poll_options:
+                total_votes += counts_map.get((poll.id, opt.id), 0)
+
+            results = []
+            for opt in poll_options:
+                v = counts_map.get((poll.id, opt.id), 0)
+                pct = (v / total_votes * 100.0) if total_votes > 0 else 0.0
+                results.append({
+                    "option_id": str(opt.id),
+                    "option_text": opt.text,
+                    "votes": v,
+                    "percentage": round(pct, 2),
+                })
+
+            response_polls.append({
+                "poll_id": str(poll.id),
+                "status": poll.status,
+                "title": poll.title,
+                "description": poll.description,
+                "closed_at": poll.closed_at.isoformat() if poll.closed_at else None,
+                "total_votes": total_votes,
+                "results": results,
+            })
+
+        audit_log(
+            action="CLOSED_POLL_RESULTS_LISTED",
+            entity_type="POLL",
+            entity_id=None,
+            details={"role": role, "count": len(response_polls)},
+        )
+        db.session.commit()
+
+        return {"count": len(response_polls), "polls": response_polls}, 200
+
+    except SQLAlchemyError:
+        db.session.rollback()
+        current_app.logger.exception("DB error fetching closed polls results")
+
+        # best-effort audit
+        try:
+            audit_log(
+                action="CLOSED_POLL_RESULTS_FETCH_FAILED",
+                entity_type="POLL",
+                entity_id=None,
+                details={"role": role},
+            )
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+            current_app.logger.exception("Audit logging failed: CLOSED_POLL_RESULTS_FETCH_FAILED")
+
+        return {"message": "Failed to fetch closed polls results"}, 500
