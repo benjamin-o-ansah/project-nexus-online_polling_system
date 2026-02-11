@@ -321,3 +321,57 @@ def delete_poll(poll_id):
         db.session.rollback()
         current_app.logger.exception("DB error deleting poll")
         return {"message": "Failed to delete poll"}, 500
+
+
+@polls_bp.get("/voter/active")
+@jwt_required()
+@roles_required("VOTER")
+@swag_from({
+    "tags": ["Polls"],
+    "summary": "VOTER: List ACTIVE polls",
+    "responses": {200: {"description": "OK"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}}
+})
+def list_active_polls_for_voter():
+    role = (get_jwt() or {}).get("role")
+
+    polls = (
+        Poll.query
+        .filter_by(status=Poll.STATUS_ACTIVE)
+        .order_by(Poll.created_at.desc())
+        .all()
+    )
+
+    _safe_audit_read(
+        action="VOTER_ACTIVE_POLLS_LISTED",
+        entity_type="POLL",
+        details={"role": role, "scope": "active", "count": len(polls)}
+    )
+
+    return {"polls": poll_read_many_schema.dump(polls)}, 200
+
+
+@polls_bp.get("/voter/closed")
+@jwt_required()
+@roles_required("VOTER")
+@swag_from({
+    "tags": ["Polls"],
+    "summary": "VOTER: List CLOSED polls",
+    "responses": {200: {"description": "OK"}, 401: {"description": "Unauthorized"}, 403: {"description": "Forbidden"}}
+})
+def list_closed_polls_for_voter():
+    role = (get_jwt() or {}).get("role")
+
+    polls = (
+        Poll.query
+        .filter_by(status=Poll.STATUS_CLOSED)
+        .order_by(Poll.closed_at.desc())
+        .all()
+    )
+
+    _safe_audit_read(
+        action="VOTER_CLOSED_POLLS_LISTED",
+        entity_type="POLL",
+        details={"role": role, "scope": "closed", "count": len(polls)}
+    )
+
+    return {"polls": poll_read_many_schema.dump(polls)}, 200
