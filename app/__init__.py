@@ -24,7 +24,9 @@ def create_app(config_class=Config) -> Flask:
             "http://127.0.0.1:3000",
             "http://localhost:8080",
             "http://127.0.0.1:8080",
-            "https://projectnexuspolling.vercel.app"
+            "https://projectnexuspolling.vercel.app",
+            "https://bbe6006a-f81d-42fe-8f11-39b51d681b25.lovableproject.com",
+            "https://id-preview--bbe6006a-f81d-42fe-8f11-39b51d681b25.lovable.app",
 
         ]}},
         supports_credentials=True,
